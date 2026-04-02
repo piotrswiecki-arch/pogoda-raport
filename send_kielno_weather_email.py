@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import os
 import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime
+from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
 from typing import Dict, Tuple, List
 from zoneinfo import ZoneInfo
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 
@@ -16,6 +20,7 @@ import requests
 # KONFIG
 # =========================
 
+TZ = "Europe/Warsaw"
 LOC_NAME = "Kielno (gm. Szemud)"
 LOCATIONS: Dict[str, Tuple[float, float]] = {
     "Kielno (gm. Szemud)": (54.45278, 18.33750),
@@ -37,20 +42,19 @@ DAYPARTS = {
     "wieczor": range(18, 24),
 }
 
+DAYPART_ORDER = ["noc", "rano", "poludnie", "wieczor"]
 DAYPART_LABELS = {
-    "noc": "nocą",
+    "noc": "noc",
     "rano": "rano",
-    "poludnie": "w południe",
-    "wieczor": "wieczorem",
+    "poludnie": "południe",
+    "wieczor": "wieczór",
 }
 
 SNOW_THRESHOLD_MM = 0.1
 
-TZ = "Europe/Warsaw"
-
 
 # =========================
-# LOGIKA POGODY
+# DANE
 # =========================
 
 def is_fog(code: int) -> bool:
@@ -63,7 +67,7 @@ def classify_precip(rain_mm: float, snow_mm: float) -> str:
     if rain_mm < 0.1 and snow_mm < 0.1:
         return "brak"
     if snow_mm >= 0.1 and rain_mm < 0.1:
-        return "snieg"
+        return "śnieg"
     if rain_mm >= 0.1 and snow_mm < 0.1:
         return "deszcz"
     return "mieszane"
@@ -72,7 +76,7 @@ def classify_precip(rain_mm: float, snow_mm: float) -> str:
 def fetch_hourly(
     lat: float,
     lon: float,
-    days: int = 7,
+    days: int = 3,
     timezone: str = TZ,
     base_url: str = "https://api.open-meteo.com/v1/forecast",
 ) -> pd.DataFrame:
@@ -140,14 +144,8 @@ def summarize_dayparts(df: pd.DataFrame, place: str, model: str) -> pd.DataFrame
     if out.empty:
         return out
 
-    order = pd.Categorical(
-        out["pora_dnia"],
-        ["noc", "rano", "poludnie", "wieczor"],
-        ordered=True
-    )
-    out = out.assign(pora_dnia=order).sort_values(
-        ["miejsce", "model", "data", "pora_dnia"]
-    )
+    out["pora_dnia"] = pd.Categorical(out["pora_dnia"], DAYPART_ORDER, ordered=True)
+    out = out.sort_values(["miejsce", "model", "data", "pora_dnia"])
     return out
 
 
@@ -197,20 +195,12 @@ def average_across_models(df_models: pd.DataFrame) -> pd.DataFrame:
         s = s.fillna(0.0)
         return int((s >= SNOW_THRESHOLD_MM).sum())
 
-    def snow_models_pct(s: pd.Series) -> float:
-        s = s.fillna(0.0)
-        if len(s) == 0:
-            return 0.0
-        return round(100.0 * float((s >= SNOW_THRESHOLD_MM).mean()), 0)
-
     snow_stats = (
         df_models.groupby(keys, observed=False)["snieg_suma"]
         .agg([
             ("snieg_min_mm", "min"),
             ("snieg_max_mm", "max"),
-            ("snieg_p90_mm", lambda x: float(x.fillna(0.0).quantile(0.9))),
             ("snieg_modele_ile", snow_models_count),
-            ("snieg_modele_pct", snow_models_pct),
         ])
         .reset_index()
     )
@@ -224,24 +214,33 @@ def average_across_models(df_models: pd.DataFrame) -> pd.DataFrame:
 
     for col in numeric_cols:
         out[col] = out[col].round(1)
+
     out["snieg_min_mm"] = out["snieg_min_mm"].round(1)
     out["snieg_max_mm"] = out["snieg_max_mm"].round(1)
-    out["snieg_p90_mm"] = out["snieg_p90_mm"].round(1)
-
-    order = pd.Categorical(
-        out["pora_dnia"],
-        ["noc", "rano", "poludnie", "wieczor"],
-        ordered=True
-    )
-    out = out.assign(pora_dnia=order).sort_values(["miejsce", "data", "pora_dnia"])
+    out["pora_dnia"] = pd.Categorical(out["pora_dnia"], DAYPART_ORDER, ordered=True)
+    out = out.sort_values(["miejsce", "data", "pora_dnia"])
     return out
 
 
 # =========================
-# PODSUMOWANIE DO MAILA
+# FILTR: dziś + jutro
 # =========================
 
-def polish_date(date_str: str) -> str:
+def filter_today_tomorrow(df: pd.DataFrame) -> pd.DataFrame:
+    today = datetime.now(ZoneInfo(TZ)).date()
+    tomorrow = today + pd.Timedelta(days=1)
+    allowed = {today.isoformat(), tomorrow.isoformat()}
+    out = df[df["data"].isin(allowed)].copy()
+    out["pora_dnia"] = pd.Categorical(out["pora_dnia"], DAYPART_ORDER, ordered=True)
+    out = out.sort_values(["data", "pora_dnia"])
+    return out
+
+
+# =========================
+# PODSUMOWANIE
+# =========================
+
+def format_polish_date(date_str: str) -> str:
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     weekdays = [
         "poniedziałek", "wtorek", "środa", "czwartek",
@@ -254,138 +253,211 @@ def polish_date(date_str: str) -> str:
     return f"{weekdays[dt.weekday()]}, {dt.day} {months[dt.month]}"
 
 
-def format_slot(row: pd.Series) -> str:
-    return f"{polish_date(row['data'])} {DAYPART_LABELS.get(str(row['pora_dnia']), str(row['pora_dnia']))}"
-
-
-def build_summary(df_loc: pd.DataFrame) -> str:
-    if df_loc.empty:
-        return "Brak danych dla Kielna."
-
-    today = datetime.now(ZoneInfo(TZ)).date().isoformat()
-    next_days = df_loc[df_loc["data"] >= today].copy()
-
-    if next_days.empty:
-        next_days = df_loc.copy()
+def build_summary(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "Brak danych dla dzisiaj i jutra."
 
     lines: List[str] = []
-    lines.append("Najważniejsze dla Kielna na najbliższe dni:")
 
-    # 1) Najmocniejszy wiatr
-    wind_row = next_days.sort_values("porywy_km_h_max", ascending=False).iloc[0]
-    lines.append(
-        f"- Najsilniejszy wiatr: {format_slot(wind_row)} "
-        f"– średni wiatr {wind_row['wiatr_km_h_sredni']:.1f} km/h, "
-        f"porywy do {wind_row['porywy_km_h_max']:.1f} km/h."
-    )
+    for date_value, day_df in df.groupby("data", observed=False):
+        day_df = day_df.sort_values("pora_dnia")
+        avg_temp = day_df["temp_C_srednia"].mean()
+        max_gust = day_df["porywy_km_h_max"].max()
+        total_rain = day_df["opad_mm_suma"].sum()
+        min_vis = day_df["widzialnosc_min_m"].dropna().min() if day_df["widzialnosc_min_m"].notna().any() else None
 
-    # 2) Największy opad
-    rain_candidates = next_days[next_days["opad_mm_suma"] >= 0.1]
-    if not rain_candidates.empty:
-        rain_row = rain_candidates.sort_values("opad_mm_suma", ascending=False).iloc[0]
-        lines.append(
-            f"- Największa szansa na mokrą pogodę: {format_slot(rain_row)} "
-            f"– suma opadu około {rain_row['opad_mm_suma']:.1f} mm."
+        text = (
+            f"<li><b>{format_polish_date(date_value)}</b>: "
+            f"średnia temperatura około <b>{avg_temp:.1f}°C</b>, "
+            f"maksymalne porywy do <b>{max_gust:.1f} km/h</b>, "
+            f"suma opadu około <b>{total_rain:.1f} mm</b>"
         )
-    else:
-        lines.append("- Większych opadów na razie nie widać.")
 
-    # 3) Najcieplej / najchłodniej
-    warm_row = next_days.sort_values("temp_C_srednia", ascending=False).iloc[0]
-    cold_row = next_days.sort_values("temp_C_srednia", ascending=True).iloc[0]
-    lines.append(
-        f"- Najcieplej zapowiada się {format_slot(warm_row)} "
-        f"– około {warm_row['temp_C_srednia']:.1f}°C."
-    )
-    lines.append(
-        f"- Najchłodniej zapowiada się {format_slot(cold_row)} "
-        f"– około {cold_row['temp_C_srednia']:.1f}°C."
+        if min_vis is not None and min_vis <= 3000:
+            text += f", możliwe okresowo słabsze warunki widzialności (do ok. <b>{int(min_vis)} m</b>)"
+
+        text += ".</li>"
+        lines.append(text)
+
+    top_wind = df.sort_values("porywy_km_h_max", ascending=False).iloc[0]
+    top_rain = df.sort_values("opad_mm_suma", ascending=False).iloc[0]
+
+    extra = (
+        f"<p><b>Najważniejsze okno pogodowe:</b> "
+        f"najmocniej może powiać <b>{format_polish_date(top_wind['data'])}</b> "
+        f"w porze <b>{DAYPART_LABELS[str(top_wind['pora_dnia'])]}</b> "
+        f"(porywy do <b>{top_wind['porywy_km_h_max']:.1f} km/h</b>).</p>"
     )
 
-    # 4) Śnieg / mieszane
-    snow_rows = next_days[next_days["snieg_modele_ile"] > 0]
-    if not snow_rows.empty:
-        snow_row = snow_rows.sort_values(
-            ["snieg_modele_ile", "snieg_max_mm"], ascending=False
-        ).iloc[0]
-        lines.append(
-            f"- Marginalny sygnał śniegu: {format_slot(snow_row)} "
-            f"– widzi to {int(snow_row['snieg_modele_ile'])}/{int(snow_row['liczba_modeli'])} modeli."
+    if float(top_rain["opad_mm_suma"]) >= 0.1:
+        extra += (
+            f"<p><b>Największa szansa na opad:</b> "
+            f"<b>{format_polish_date(top_rain['data'])}</b> "
+            f"w porze <b>{DAYPART_LABELS[str(top_rain['pora_dnia'])]}</b> "
+            f"(około <b>{top_rain['opad_mm_suma']:.1f} mm</b>).</p>"
         )
-    else:
-        lines.append("- Na ten moment modele praktycznie nie pokazują śniegu.")
 
-    # 5) Słaba widzialność
-    low_vis = next_days[next_days["widzialnosc_min_m"].notna()].sort_values("widzialnosc_min_m")
-    if not low_vis.empty:
-        vis_row = low_vis.iloc[0]
-        if int(vis_row["widzialnosc_min_m"]) <= 3000:
-            lines.append(
-                f"- Uwaga na gorszą widzialność: {format_slot(vis_row)} "
-                f"– minimum około {int(vis_row['widzialnosc_min_m'])} m."
-            )
-
-    # 6) Krótkie zdanie ogólne
-    strong_wind_count = int((next_days["porywy_km_h_max"] >= 60).sum())
-    rainy_count = int((next_days["opad_mm_suma"] >= 0.3).sum())
-
-    if strong_wind_count >= 2:
-        lines.append("- Ogólnie: najbardziej odczuwalny temat w prognozie to wiatr.")
-    elif rainy_count >= 2:
-        lines.append("- Ogólnie: prognoza wygląda na dość zmienną i okresami mokrą.")
-    else:
-        lines.append("- Ogólnie: bez pogodowego dramatu, ale warto obserwować wiatr i krótkie epizody opadów.")
-
-    return "\n".join(lines)
-
-
-def build_email_text(df_loc: pd.DataFrame) -> str:
-    updated_at = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M %Z")
-    summary = build_summary(df_loc)
-
-    preview = df_loc.copy()
-    preview = preview[[
-        "data", "pora_dnia", "temp_C_srednia", "wiatr_km_h_sredni",
-        "porywy_km_h_max", "opad_mm_suma", "typ_opadu",
-        "widzialnosc_min_m", "liczba_modeli"
-    ]].head(12)
-
-    table_txt = preview.to_string(index=False)
-
-    return f"""Raport pogody dla: {LOC_NAME}
-Aktualizacja: {updated_at}
-
-{summary}
-
-Najbliższe wpisy z raportu:
-{table_txt}
-
-Źródło: Open-Meteo, średnia z modeli: {", ".join(MODELS.keys())}
-"""
+    return "<ul>" + "".join(lines) + "</ul>" + extra
 
 
 # =========================
-# SMTP
+# WYKRESY
 # =========================
 
-def send_email(subject: str, body: str) -> None:
+def add_x_labels(df_plot: pd.DataFrame) -> pd.DataFrame:
+    out = df_plot.copy()
+    out["x_label"] = out.apply(
+        lambda r: f"{r['data'][5:]}\n{DAYPART_LABELS[str(r['pora_dnia'])]}",
+        axis=1
+    )
+    return out
+
+
+def save_temp_chart(df: pd.DataFrame, path: str) -> None:
+    d = add_x_labels(df)
+    plt.figure(figsize=(10, 4.5))
+    plt.plot(d["x_label"], d["temp_C_srednia"], marker="o")
+    plt.title("Kielno – temperatura (dziś i jutro)")
+    plt.ylabel("°C")
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def save_wind_chart(df: pd.DataFrame, path: str) -> None:
+    d = add_x_labels(df)
+    plt.figure(figsize=(10, 4.5))
+    plt.plot(d["x_label"], d["wiatr_km_h_sredni"], marker="o", label="wiatr średni")
+    plt.plot(d["x_label"], d["porywy_km_h_max"], marker="o", label="porywy max")
+    plt.title("Kielno – wiatr i porywy (dziś i jutro)")
+    plt.ylabel("km/h")
+    plt.xticks(rotation=0)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def save_rain_chart(df: pd.DataFrame, path: str) -> None:
+    d = add_x_labels(df)
+    plt.figure(figsize=(10, 4.5))
+    plt.bar(d["x_label"], d["opad_mm_suma"])
+    plt.title("Kielno – opad (dziś i jutro)")
+    plt.ylabel("mm")
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+# =========================
+# TABELA HTML
+# =========================
+
+def build_table_html(df: pd.DataFrame) -> str:
+    tbl = df.copy()
+    tbl["pora_dnia"] = tbl["pora_dnia"].astype(str).map(DAYPART_LABELS)
+    tbl["data"] = tbl["data"].map(format_polish_date)
+
+    tbl = tbl[[
+        "data",
+        "pora_dnia",
+        "temp_C_srednia",
+        "wiatr_km_h_sredni",
+        "porywy_km_h_max",
+        "opad_mm_suma",
+        "typ_opadu",
+        "widzialnosc_min_m",
+    ]]
+
+    tbl = tbl.rename(columns={
+        "data": "Dzień",
+        "pora_dnia": "Pora dnia",
+        "temp_C_srednia": "Temp. °C",
+        "wiatr_km_h_sredni": "Wiatr km/h",
+        "porywy_km_h_max": "Porywy km/h",
+        "opad_mm_suma": "Opad mm",
+        "typ_opadu": "Typ opadu",
+        "widzialnosc_min_m": "Widzialność min m",
+    })
+
+    return tbl.to_html(index=False, border=0, justify="left")
+
+
+# =========================
+# MAIL
+# =========================
+
+def send_email(subject: str, html_body: str, attachments: List[Tuple[str, str]], csv_path: str | None = None) -> None:
     smtp_host = os.environ["SMTP_HOST"]
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ["SMTP_USER"]
     smtp_password = os.environ["SMTP_PASSWORD"]
-    mail_from = os.environ.get("MAIL_FROM", smtp_user)
+
+    mail_from = os.environ["MAIL_FROM"]
     mail_to = os.environ["MAIL_TO"]
 
-    msg = MIMEMultipart()
+    msg = MIMEMultipart("related")
+    msg["Subject"] = subject
     msg["From"] = mail_from
     msg["To"] = mail_to
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    alt = MIMEMultipart("alternative")
+    msg.attach(alt)
+    alt.attach(MIMEText("Raport HTML nie został wyświetlony.", "plain", "utf-8"))
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
+
+    for cid, filepath in attachments:
+        with open(filepath, "rb") as f:
+            img = MIMEImage(f.read())
+            img.add_header("Content-ID", f"<{cid}>")
+            img.add_header("Content-Disposition", "inline", filename=Path(filepath).name)
+            msg.attach(img)
+
+    if csv_path:
+        with open(csv_path, "rb") as f:
+            part = MIMEApplication(f.read(), Name=Path(csv_path).name)
+            part["Content-Disposition"] = f'attachment; filename="{Path(csv_path).name}"'
+            msg.attach(part)
 
     with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
         server.starttls()
         server.login(smtp_user, smtp_password)
         server.sendmail(mail_from, [x.strip() for x in mail_to.split(",")], msg.as_string())
+
+
+def build_html_email(df: pd.DataFrame, updated_at: str) -> str:
+    summary_html = build_summary(df)
+    table_html = build_table_html(df)
+
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; color: #222; line-height: 1.5;">
+        <h2>Raport pogody – Kielno</h2>
+        <p><b>Zakres:</b> dzisiaj i jutro<br>
+           <b>Aktualizacja:</b> {updated_at}</p>
+
+        {summary_html}
+
+        <h3>Wykres temperatury</h3>
+        <img src="cid:temp_chart" style="max-width: 100%; border: 1px solid #ddd; border-radius: 8px;">
+
+        <h3>Wykres wiatru i porywów</h3>
+        <img src="cid:wind_chart" style="max-width: 100%; border: 1px solid #ddd; border-radius: 8px;">
+
+        <h3>Wykres opadu</h3>
+        <img src="cid:rain_chart" style="max-width: 100%; border: 1px solid #ddd; border-radius: 8px;">
+
+        <h3>Tabela szczegółowa</h3>
+        {table_html}
+
+        <p style="font-size: 12px; color: #666;">
+          Dane: Open-Meteo, średnia z modeli: {", ".join(MODELS.keys())}
+        </p>
+      </body>
+    </html>
+    """
 
 
 # =========================
@@ -398,7 +470,7 @@ def main() -> None:
 
     for model_name, base_url in MODELS.items():
         try:
-            hourly = fetch_hourly(lat, lon, days=7, base_url=base_url)
+            hourly = fetch_hourly(lat, lon, days=3, base_url=base_url)
             s = summarize_dayparts(hourly, place, model_name)
             if s is not None and not s.empty:
                 all_models_parts.append(s)
@@ -412,13 +484,39 @@ def main() -> None:
     df_models = pd.concat(all_models_parts, ignore_index=True)
     df = average_across_models(df_models)
     df_loc = df[df["miejsce"] == LOC_NAME].copy()
+    df_mail = filter_today_tomorrow(df_loc)
 
-    subject_date = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d")
-    subject = f"Pogoda – Kielno – {subject_date}"
-    body = build_email_text(df_loc)
+    if df_mail.empty:
+        raise SystemExit("Brak danych dla dziś i jutra.")
 
-    print(body)
-    send_email(subject, body)
+    out_dir = Path("mail_output")
+    out_dir.mkdir(exist_ok=True)
+
+    temp_chart = str(out_dir / "temp.png")
+    wind_chart = str(out_dir / "wind.png")
+    rain_chart = str(out_dir / "rain.png")
+    csv_path = str(out_dir / "kielno_dzis_jutro.csv")
+
+    save_temp_chart(df_mail, temp_chart)
+    save_wind_chart(df_mail, wind_chart)
+    save_rain_chart(df_mail, rain_chart)
+    df_mail.to_csv(csv_path, index=False)
+
+    updated_at = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M %Z")
+    subject = f"Pogoda Kielno – dziś i jutro – {datetime.now(ZoneInfo(TZ)).strftime('%Y-%m-%d')}"
+    html_body = build_html_email(df_mail, updated_at)
+
+    send_email(
+        subject=subject,
+        html_body=html_body,
+        attachments=[
+            ("temp_chart", temp_chart),
+            ("wind_chart", wind_chart),
+            ("rain_chart", rain_chart),
+        ],
+        csv_path=csv_path,
+    )
+
     print("[OK] Mail wysłany.")
 
 
